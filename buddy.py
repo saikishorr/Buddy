@@ -1,33 +1,29 @@
- from langchain_ollama import ChatOllama
+import sqlite3
+from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
-
-# Define the state
-class State(TypedDict): 
+ 
+class State(TypedDict):
     messages: list
  
-# Use Ollama with gemma:2b
-ollama_model = ChatOllama(model="gemma:2b")
-
-# Define LangGraph workflow
-workflow = StateGraph(State)
-
-def chatbot_node(state: State):
-    response = ollama_model.invoke(state["messages"])
-    return {"messages": state["messages"] + [response]}
-
-workflow.add_node("chatbot", chatbot_node)
-workflow.set_entry_point("chatbot")
-workflow.add_edge("chatbot", END)
-
-# Compile graph
-app = workflow.compile()
-
-# Test the chatbot
-result = app.invoke({"messages": ["what is the fullform of SIP?"]})
-# print(result)
+llm = ChatOllama(model="gemma:2b")
+app = (
+    StateGraph(State)
+    .add_node("chatbot", lambda s: {"messages": s["messages"] + [llm.invoke(s["messages"])]})
+    .set_entry_point("chatbot")
+    .add_edge("chatbot", END)
+    .compile()
+)
  
-# Get the last AI message
-ai_message = result["messages"][-1]
-print(ai_message.content)
+def save_chat(q, a):
+    with sqlite3.connect("chat_history.db") as conn:
+        conn.execute("INSERT INTO chat_logs (question, answer) VALUES (?, ?)", (q, a))
+        conn.commit()
  
+question = input("Enter your question: ")
+result = app.invoke({"messages": [question]})
+answer = result["messages"][-1].content
+ 
+print(f"👤 {question}\n🤖 {answer}")
+save_chat(question, answer)
+print("💾 Chat saved!")
