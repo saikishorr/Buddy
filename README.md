@@ -46,3 +46,5 @@ Here’s a **ready-to-use prompt** to generate a **PowerPoint presentation** for
 
 
 https://github.com/ashishpatel26/500-AI-Agents-Projects
+
+Shahrukh.Gawandi@credencerm.com
