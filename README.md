@@ -45,3 +45,4 @@ Here’s a **ready-to-use prompt** to generate a **PowerPoint presentation** for
 *Use modern, tech-themed design elements (e.g., gradient backgrounds, AI-themed icons). Use concise bullet points and placeholders for diagrams or screenshots. Export the result as a **.pptx** file.*
 
 
+https://github.com/ashishpatel26/500-AI-Agents-Projects
