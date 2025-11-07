@@ -2,7 +2,7 @@ import sqlite3
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
-
+ 
 # Define state
 class State(TypedDict):
     messages: list
@@ -45,3 +45,4 @@ print(f"🤖 Answer: {answer}")
 # --- Save to DB ---
 save_to_db(question, answer)
 print("💾 Chat saved to database!")
+
