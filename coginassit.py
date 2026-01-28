@@ -461,3 +461,580 @@ def admin_rebuild(recreate: bool = True, current_user: Dict = Depends(get_curren
     global faiss_index, faiss_metadata
     faiss_index, faiss_metadata = build_vector_store_from_folder(recreate=recreate)
     return {"status": "rebuilt", "docs_indexed": len(faiss_metadata)}
+
+
+
+
+
+----
+-
+-
+    -
+
+    -
+    -
+    # =========================================================
+# ኀ BuddyAI – Enterprise LLM Assistant
+# LLM + LangGraph + FAISS RAG + Tickets + Sentiment + Gradio
+# =========================================================
+import os, sqlite3, time
+import pandas as pd
+import gradio as gr
+from typing import TypedDict, List
+
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq
+
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+# =========================================================
+# ኇ CONFIG
+# =========================================================
+GROQ_API_KEY = ""
+DB = "buddyai.db"
+DATASET_DIR = "/content/datasets" # Define DATASET_DIR here
+
+# =========================================================
+# ኃ EMBEDDING MODEL
+# =========================================================
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# =========================================================
+# ኆ DATABASE
+# =========================================================
+def init_db():
+    with sqlite3.connect(DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS tickets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user TEXT, role TEXT,
+            question TEXT, sentiment TEXT,
+            status TEXT, created INTEGER
+        )"""
+)
+init_db()
+
+# =========================================================
+# ኇ USERS
+# =========================================================
+users_df = pd.read_csv(os.path.join(DATASET_DIR, "users.csv")) # Use DATASET_DIR
+USERS = {
+    r["username"]: {"password": str(r["password"]), "role": r["role"]}
+    for _, r in users_df.iterrows()
+}
+
+def authenticate(u, p):
+    return USERS[u]["role"] if u in USERS and USERS[u]["password"] == str(p) else None
+
+# =========================================================
+# ኈ LOAD & CHUNK DATASETS
+# =========================================================
+def load_chunks() -> List[str]:
+    chunks = []
+    # Use DATASET_DIR for listing files
+    for f in os.listdir(DATASET_DIR):
+        f_path = os.path.join(DATASET_DIR, f)
+        if f_path.endswith(".csv") and f != "users.csv": # Check f_path for consistency
+            try:
+                df = pd.read_csv(f_path) # Read from f_path
+                for row in df.astype(str).values:
+                    chunks.append(" | ".join(row))
+            except:
+                pass
+    return chunks
+
+DOCUMENTS = load_chunks()
+
+# =========================================================
+# ኂ BUILD FAISS INDEX
+# =========================================================
+embeddings = embedder.encode(DOCUMENTS)
+dimension = embeddings.shape[1]
+index = faiss.IndexFlatL2(dimension)
+index.add(np.array(embeddings))
+
+def retrieve_context(query, k=5):
+    q_emb = embedder.encode([query])
+    D, I = index.search(np.array(q_emb), k)
+    return "\n".join([DOCUMENTS[i] for i in I[0]])
+
+# =========================================================
+# ኁ SENTIMENT (RULE-BASED USING DATASETS)
+# =========================================================
+def detect_sentiment(text):
+    t = text.lower()
+    if any(w in t for w in ["angry", "frustrated", "furious", "annoyed"]):
+        return "Angry"
+    if any(w in t for w in ["abuse", "hate", "idiot", "worst"]):
+        return "Toxic"
+    return "Normal"
+
+# =========================================================
+# ኃ LLM
+# =========================================================
+llm = ChatGroq(
+    api_key=GROQ_API_KEY,
+    model="groq/compound",       # ✅ slightly bigger model
+    temperature=0.2,
+    model_kwargs={}
+)
+
+# =========================================================
+# ኆ LANGGRAPH STATE
+# =========================================================
+class State(TypedDict):
+    user: str
+    role: str
+    question: str
+    answer: str
+
+# =========================================================
+# ኅ LANGGRAPH NODES
+# =========================================================
+def guard(state):
+    if state["role"] is None:
+        state["answer"] = "❌ Invalid credentials"
+    return state
+
+def rag_llm(state):
+    try:
+        context = retrieve_context(state["question"])
+        prompt = f"""
+You are BuddyAI for NovaEdge Technologies.
+
+User Role: {state['role']}
+
+Context:
+{context}
+
+Question:
+{state['question']}
+"""
+        reply = llm.invoke(prompt).content
+
+        sentiment = detect_sentiment(state["question"])
+
+        if any(w in state["question"].lower() for w in ["issue", "problem", "not working", "ticket"]):
+            with sqlite3.connect(DB) as c:
+                c.execute("""INSERT INTO tickets
+                    VALUES (NULL,?,?,?,?,?,?)""",
+                    (state["user"], state["role"],
+                     state["question"], sentiment,
+                     "Open", int(time.time())))
+            reply += f"\n\nኃ Ticket created | Sentiment: {sentiment}"
+
+        state["answer"] = reply
+        return state
+
+    except Exception as e:
+        state["answer"] = f"⚠️ System error: {e}"
+        return state
+
+# =========================================================
+# ኊ LANGGRAPH FLOW
+# =========================================================
+g = StateGraph(State)
+g.add_node("guard", guard)
+g.add_node("rag", rag_llm)
+g.set_entry_point("guard")
+g.add_edge("guard", "rag")
+g.add_edge("rag", END)
+graph = g.compile()
+
+# =========================================================
+# ኀ BACKEND FUNCTIONS
+# =========================================================
+def chat(user, pwd, msg):
+    role = authenticate(user, pwd)
+
+    result = graph.invoke({
+        "user": user,
+        "role": role,
+        "question": msg,
+        "answer": ""
+    })
+
+    return result["answer"], role
+
+
+def my_tickets(user):
+    with sqlite3.connect(DB) as c:
+        rows = c.execute("SELECT id,question,sentiment,status FROM tickets WHERE user=?", (user,)).fetchall()
+    return [{"Ticket": f"TICK-{r[0]}", "Issue": r[1], "Sentiment": r[2], "Status": r[3]} for r in rows]
+
+def all_tickets(user, role):
+    if role not in ["admin", "manager"]:
+        return {"error": "❌ Access denied"}
+
+    with sqlite3.connect(DB) as c:
+        rows = c.execute(
+            "SELECT id,user,question,sentiment,status FROM tickets"
+        ).fetchall()
+
+    return [
+        {
+            "Ticket": f"TICK-{r[0]}",
+            "User": r[1],
+            "Issue": r[2],
+            "Sentiment": r[3],
+            "Status": r[4]
+        }
+        for r in rows
+    ]
+
+
+def update_ticket(user, role, tid, status):
+    if role not in ["admin", "manager"]:
+        return "❌ Access denied"
+
+    tid = int(tid.replace("TICK-", ""))
+
+    with sqlite3.connect(DB) as c:
+        c.execute(
+            "UPDATE tickets SET status=? WHERE id=?",
+            (status, tid)
+        )
+
+    return "✅ Ticket updated"
+
+
+# =========================================================
+# ኆ️ GRADIO UI
+# =========================================================
+with gr.Blocks() as ui:
+    gr.Markdown("# ኀ BuddyAI – Enterprise Assistant")
+
+    user = gr.Textbox(label="Username")
+    pwd = gr.Textbox(label="Password", type="password")
+
+    q = gr.Textbox(label="Chatbot")
+    a = gr.Markdown()
+
+    role_state = gr.State()
+
+    send_btn = gr.Button("Send")
+    send_btn.click(chat, [user, pwd, q], [a, role_state])
+
+    # ---------------- My Tickets ----------------
+    gr.Markdown("## ኃ My Tickets")
+    my = gr.JSON()
+    gr.Button("Refresh").click(my_tickets, user, my)
+
+    # ---------------- Admin / Manager Section ----------------
+    admin_box = gr.Group(visible=False)
+
+    with admin_box:
+        gr.Markdown("## ኄ Admin / Manager Tickets")
+
+        all_view = gr.JSON()
+        gr.Button("Refresh Admin View").click(
+            all_tickets,
+            [user, role_state],
+            all_view
+        )
+
+        tid = gr.Textbox(label="Ticket ID (Admin)")
+        status = gr.Dropdown(["Open", "In Progress", "Closed"])
+        gr.Button("Update Ticket").click(
+            update_ticket,
+            [user, role_state, tid, status],
+            a
+        )
+
+    # ---------- Role-based UI visibility ----------
+    def toggle_admin(role):
+        return gr.update(visible=role in ["admin", "manager"])
+
+    role_state.change(toggle_admin, role_state, admin_box)
+
+ui.launch(share=True)
+
+
+
+
+-----
+-
+-
+    -
+    -
+    -
+    -
+    # =========================================================
+# ኀ BuddyAI – Enterprise LLM Assistant
+# LLM + LangGraph + FAISS RAG + Tickets + Sentiment + Gradio
+# =========================================================
+import os, sqlite3, time
+import pandas as pd
+import gradio as gr
+from typing import TypedDict, List
+
+from langgraph.graph import StateGraph, END
+from langchain_groq import ChatGroq
+
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+# =========================================================
+# ኇ CONFIG
+# =========================================================
+GROQ_API_KEY = ""
+DB = "buddyai.db"
+DATASET_DIR = "/content/datasets" # Define DATASET_DIR here
+
+# =========================================================
+# ኃ EMBEDDING MODEL
+# =========================================================
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+# =========================================================
+# ኆ DATABASE
+# =========================================================
+def init_db():
+    with sqlite3.connect(DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS tickets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user TEXT, role TEXT,
+            question TEXT, sentiment TEXT,
+            status TEXT, created INTEGER
+        )"""
+)
+init_db()
+
+# =========================================================
+# ኇ USERS
+# =========================================================
+users_df = pd.read_csv(os.path.join(DATASET_DIR, "users.csv")) # Use DATASET_DIR
+USERS = {
+    r["username"]: {"password": str(r["password"]), "role": r["role"]}
+    for _, r in users_df.iterrows()
+}
+
+def authenticate(u, p):
+    return USERS[u]["role"] if u in USERS and USERS[u]["password"] == str(p) else None
+
+# =========================================================
+# ኈ LOAD & CHUNK DATASETS
+# =========================================================
+def load_chunks() -> List[str]:
+    chunks = []
+    # Use DATASET_DIR for listing files
+    for f in os.listdir(DATASET_DIR):
+        f_path = os.path.join(DATASET_DIR, f)
+        if f_path.endswith(".csv") and f != "users.csv": # Check f_path for consistency
+            try:
+                df = pd.read_csv(f_path) # Read from f_path
+                for row in df.astype(str).values:
+                    chunks.append(" | ".join(row))
+            except:
+                pass
+    return chunks
+
+DOCUMENTS = load_chunks()
+
+# =========================================================
+# ኂ BUILD FAISS INDEX
+# =========================================================
+embeddings = embedder.encode(DOCUMENTS)
+dimension = embeddings.shape[1]
+index = faiss.IndexFlatL2(dimension)
+index.add(np.array(embeddings))
+
+def retrieve_context(query, k=5):
+    q_emb = embedder.encode([query])
+    D, I = index.search(np.array(q_emb), k)
+    return "\n".join([DOCUMENTS[i] for i in I[0]])
+
+# =========================================================
+# ኁ SENTIMENT (RULE-BASED USING DATASETS)
+# =========================================================
+def detect_sentiment(text):
+    t = text.lower()
+    if any(w in t for w in ["angry", "frustrated", "furious", "annoyed"]):
+        return "Angry"
+    if any(w in t for w in ["abuse", "hate", "idiot", "worst"]):
+        return "Toxic"
+    return "Normal"
+
+# =========================================================
+# ኃ LLM
+# =========================================================
+llm = ChatGroq(
+    api_key=GROQ_API_KEY,
+    model="groq/compound",       # ✅ slightly bigger model
+    temperature=0.2,
+    model_kwargs={}
+)
+
+# =========================================================
+# ኆ LANGGRAPH STATE
+# =========================================================
+class State(TypedDict):
+    user: str
+    role: str
+    question: str
+    answer: str
+
+# =========================================================
+# ኅ LANGGRAPH NODES
+# =========================================================
+def guard(state):
+    if state["role"] is None:
+        state["answer"] = "❌ Invalid credentials"
+    return state
+
+def rag_llm(state):
+    try:
+        context = retrieve_context(state["question"])
+        prompt = f"""
+You are BuddyAI for NovaEdge Technologies.
+
+User Role: {state['role']}
+
+Context:
+{context}
+
+Question:
+{state['question']}
+"""
+        reply = llm.invoke(prompt).content
+
+        sentiment = detect_sentiment(state["question"])
+
+        if any(w in state["question"].lower() for w in ["issue", "problem", "not working", "ticket"]):
+            with sqlite3.connect(DB) as c:
+                c.execute("""INSERT INTO tickets
+                    VALUES (NULL,?,?,?,?,?,?)""",
+                    (state["user"], state["role"],
+                     state["question"], sentiment,
+                     "Open", int(time.time())))
+            reply += f"\n\nኃ Ticket created | Sentiment: {sentiment}"
+
+        state["answer"] = reply
+        return state
+
+    except Exception as e:
+        state["answer"] = f"⚠️ System error: {e}"
+        return state
+
+# =========================================================
+# ኊ LANGGRAPH FLOW
+# =========================================================
+g = StateGraph(State)
+g.add_node("guard", guard)
+g.add_node("rag", rag_llm)
+g.set_entry_point("guard")
+g.add_edge("guard", "rag")
+g.add_edge("rag", END)
+graph = g.compile()
+
+# =========================================================
+# ኀ BACKEND FUNCTIONS
+# =========================================================
+def chat(user, pwd, msg):
+    role = authenticate(user, pwd)
+
+    result = graph.invoke({
+        "user": user,
+        "role": role,
+        "question": msg,
+        "answer": ""
+    })
+
+    return result["answer"], role
+
+
+def my_tickets(user):
+    with sqlite3.connect(DB) as c:
+        rows = c.execute("SELECT id,question,sentiment,status FROM tickets WHERE user=?", (user,)).fetchall()
+    return [{"Ticket": f"TICK-{r[0]}", "Issue": r[1], "Sentiment": r[2], "Status": r[3]} for r in rows]
+
+def all_tickets(user, role):
+    if role not in ["admin", "manager"]:
+        return {"error": "❌ Access denied"}
+
+    with sqlite3.connect(DB) as c:
+        rows = c.execute(
+            "SELECT id,user,question,sentiment,status FROM tickets"
+        ).fetchall()
+
+    return [
+        {
+            "Ticket": f"TICK-{r[0]}",
+            "User": r[1],
+            "Issue": r[2],
+            "Sentiment": r[3],
+            "Status": r[4]
+        }
+        for r in rows
+    ]
+def update_ticket(user, role, tid, status):
+    if role not in ["admin", "manager"]:
+        return "❌ Access denied"
+
+    tid = int(tid.replace("TICK-", ""))
+
+    with sqlite3.connect(DB) as c:
+        c.execute(
+            "UPDATE tickets SET status=? WHERE id=?",
+            (status, tid)
+        )
+
+    return "✅ Ticket updated"
+
+# =========================================================
+# ኆ️ GRADIO UI
+# =========================================================
+with gr.Blocks() as ui:
+    gr.Markdown("# ኀ BuddyAI – Enterprise Assistant")
+
+    user = gr.Textbox(label="Username")
+    pwd = gr.Textbox(label="Password", type="password")
+
+    q = gr.Textbox(label="Chatbot")
+    a = gr.Markdown()
+
+    role_state = gr.State()
+
+    # -------- Chat --------
+    gr.Button("Send").click(
+        chat,
+        [user, pwd, q],
+        [a, role_state]
+    )
+
+    # -------- My Tickets --------
+    gr.Markdown("## ኃ My Tickets")
+    my = gr.JSON()
+    gr.Button("Refresh").click(my_tickets, user, my)
+
+    # -------- Admin / Manager Section --------
+    admin_panel = gr.Group(visible=False)
+
+    with admin_panel:
+        gr.Markdown("## ኄ Admin / Manager Tickets")
+
+        all_view = gr.JSON()
+        gr.Button("Refresh Admin View").click(
+            all_tickets,
+            [user, role_state],
+            all_view
+        )
+
+        tid = gr.Textbox(label="Ticket ID (Admin)")
+        status = gr.Dropdown(["Open", "In Progress", "Closed"])
+        gr.Button("Update Ticket").click(
+            update_ticket,
+            [user, role_state, tid, status],
+            a
+        )
+
+    # -------- Role-based UI toggle --------
+    def toggle_admin(role):
+        return gr.update(visible=role in ["admin", "manager"])
+
+    role_state.change(toggle_admin, role_state, admin_panel)
+
+ui.launch(share=True)
+ 
